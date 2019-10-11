@@ -1,85 +1,151 @@
 package main
 
-
 import (
-    "fmt"
-    "os"
-    machineapi "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
-    awsprovider "sigs.k8s.io/cluster-api-provider-aws/pkg/apis/awsproviderconfig/v1beta1"
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    //"k8s.io/utils/pointer"
-    //corev1 "k8s.io/api/core/v1"
-    //"k8s.io/apimachinery/pkg/runtime"
+	"fmt"
+	machineapi "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"os"
+	awsprovider "sigs.k8s.io/cluster-api-provider-aws/pkg/apis/awsproviderconfig/v1beta1"
+	//"k8s.io/utils/pointer"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-    "k8s.io/client-go/tools/clientcmd"
-    "k8s.io/client-go/kubernetes"
-    "flag"
-    mapiclient "github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset"
+	"k8s.io/client-go/tools/clientcmd"
+	//"k8s.io/client-go/kubernetes"
+	"flag"
+	mapiclient "github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset"
 	//machinev1beta1client "github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset/typed/machine/v1beta1"
 )
 
 func main() {
-    var (
+	var (
 		kubeconfig string
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.Parse()
-    // creates the connection
-    // creates the connection
 	kconfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		fmt.Println(err)
-        os.Exit(1)
+		os.Exit(1)
 	}
 
-    // creates the clientset
-	client, err := kubernetes.NewForConfig(kconfig)
+	// creates the clientset
+	/*
+		client, err := kubernetes.NewForConfig(kconfig)
+		if err != nil {
+			fmt.Println(err)
+	        os.Exit(1)
+		}
+	    //fmt.Printf("client: %v \n", client)
+	*/
+
+	machineClient, err := mapiclient.NewForConfig(kconfig)
 	if err != nil {
 		fmt.Println(err)
-        os.Exit(1)
-	}
-    fmt.Printf("client: %v \n", client)
-
-    machineClient, err := mapiclient.NewForConfig(kconfig)
-	if err != nil {
-        fmt.Println(err)
-        os.Exit(1)
+		os.Exit(1)
 	}
 
-    machineClientset := machineClient.MachineV1beta1().MachineSets("openshift-machine-api")
-    machinesets1, err := machineClientset.List(metav1.ListOptions{})
+	machineClientset := machineClient.MachineV1beta1().MachineSets("openshift-machine-api")
+	machinesets1, err := machineClientset.List(metav1.ListOptions{})
 	if err != nil {
 		fmt.Println("failed to list machines: %v", err)
-        os.Exit(1)
+		os.Exit(1)
 	}
-    fmt.Printf("machinesets: %v \n", machinesets1)
+	//fmt.Printf("machinesets: %v \n", machinesets1)
 
-    /*
-    instanceType := "testing"
-    volumeType := "type"
-    volumeSize := 10
-    iops := 2500
-	azs := []string{"a", "b", "c"}
-    amiID := "test"
-    clusterID := "test"
-    role := "role"
-    region := "region1"
-    userDataSecret := "worker-remote"
-    poolName := "x"
-    userTags := map[string]string{"a": "1"}
-    tags, _ := tagsFromUserTags(clusterID, userTags)
-    */
+	codec, err := awsprovider.NewCodec()
+	if err != nil {
+		fmt.Println("failed to build codec: %v", err)
+		os.Exit(1)
+	}
+
 	var newMachineSets []*machineapi.MachineSet
-	for _, ms := range machinesets1.Items {
-        // skip machinesets labeled as remote
-        _, exists := ms.ObjectMeta.Labels["remote"]
-        if exists {
-            continue
-        }
-        newMS := ms.DeepCopy()
-		//replicas := int32(1)
-        //newMS.Spec.Template.Spec.ProviderSpec.Value = ms.Spec.Template.Spec.ProviderSpec
+	msMap := make(map[string]*machineapi.MachineSet)
+	var originalMachineSetNames []string
+	for i, ms := range machinesets1.Items {
+		msMap[ms.Name] = &machinesets1.Items[i]
+		// skip machinesets labeled as remote
+		_, exists := ms.ObjectMeta.Labels["remote"]
+		if exists {
+			continue
+		}
+		originalMachineSetNames = append(originalMachineSetNames, ms.Name)
+	}
+	//fmt.Println("map: ", msMap)
+	for _, msName := range originalMachineSetNames {
+		if _, ok := msMap[msName+"-remote"]; ok {
+			// already copied to remote.
+			continue
+		}
+		ms := *msMap[msName]
+		newMS := ms.DeepCopy()
+		replicasDesired := int32(0)
+		newMS.Spec.Replicas = &replicasDesired
+		newObjectMeta := metav1.ObjectMeta{
+			Namespace: "openshift-machine-api",
+			Name:      msName + "-remote",
+			Labels: map[string]string{
+				"remote": "remote",
+			},
+		}
+		newMS.ObjectMeta = newObjectMeta
+		newMS.Status = machineapi.MachineSetStatus{}
+		newMS.Spec.Template.ObjectMeta.Labels["machine.openshift.io/cluster-api-machineset"] = msName + "-remote"
+		newMS.Spec.Selector.MatchLabels["machine.openshift.io/cluster-api-machineset"] = msName + "-remote"
+
+		conf, err2 := providerConfigFromMachine(newMS.Spec.Template, codec)
+		if err2 != nil {
+			fmt.Println("failed to get provider spec: ", err2)
+			os.Exit(1)
+		}
+		conf.UserDataSecret = &corev1.LocalObjectReference{Name: conf.UserDataSecret.Name + "-remote"}
+		//fmt.Println("spec: %v", conf)
+		newMS.Spec.Template.Spec.ProviderSpec.Value = &runtime.RawExtension{Object: conf}
+		newMachineSets = append(newMachineSets, newMS)
+	}
+	fmt.Println("New machinesets to be created ", len(newMachineSets))
+
+	for _, ms := range newMachineSets {
+		if _, err := machineClientset.Create(ms); err != nil {
+			fmt.Println("Unable to create machineset ", ms.Name, err)
+			os.Exit(1)
+		}
+	}
+	//fmt.Println("machinesets: %v", newMachineSets[0])
+}
+
+func tagsFromUserTags(clusterID string, usertags map[string]string) ([]awsprovider.TagSpecification, error) {
+	tags := []awsprovider.TagSpecification{
+		{Name: fmt.Sprintf("kubernetes.io/cluster/%s", clusterID), Value: "owned"},
+	}
+	forbiddenTags := sets.NewString()
+	for idx := range tags {
+		forbiddenTags.Insert(tags[idx].Name)
+	}
+	for k, v := range usertags {
+		if forbiddenTags.Has(k) {
+			return nil, fmt.Errorf("user tags may not clobber %s", k)
+		}
+		tags = append(tags, awsprovider.TagSpecification{Name: k, Value: v})
+	}
+	return tags, nil
+}
+
+// providerConfigFromMachine gets the machine provider config MachineSetSpec from the
+// specified cluster-api MachineSpec.
+func providerConfigFromMachine(machineTemplate machineapi.MachineTemplateSpec, codec *awsprovider.AWSProviderConfigCodec) (*awsprovider.AWSMachineProviderConfig, error) {
+	if machineTemplate.Spec.ProviderSpec.Value == nil {
+		return nil, fmt.Errorf("unable to find machine provider config: Spec.ProviderSpec.Value is not set")
+	}
+
+	var config awsprovider.AWSMachineProviderConfig
+	if err := codec.DecodeProviderSpec(&machineTemplate.Spec.ProviderSpec, &config); err != nil {
+		return nil, err
+	}
+	return &config, nil
+}
+
 /*
 		provider := &awsprovider.AWSMachineProviderConfig{
     		TypeMeta: metav1.TypeMeta{
@@ -154,25 +220,4 @@ func main() {
 				},
 			},
 		}
-    */
-		newMachineSets = append(newMachineSets, newMS)
-	}
-    fmt.Println("machinesets: %v", newMachineSets[0])
-}
-
-func tagsFromUserTags(clusterID string, usertags map[string]string) ([]awsprovider.TagSpecification, error) {
-	tags := []awsprovider.TagSpecification{
-		{Name: fmt.Sprintf("kubernetes.io/cluster/%s", clusterID), Value: "owned"},
-	}
-	forbiddenTags := sets.NewString()
-	for idx := range tags {
-		forbiddenTags.Insert(tags[idx].Name)
-	}
-	for k, v := range usertags {
-		if forbiddenTags.Has(k) {
-			return nil, fmt.Errorf("user tags may not clobber %s", k)
-		}
-		tags = append(tags, awsprovider.TagSpecification{Name: k, Value: v})
-	}
-	return tags, nil
-}
+*/
