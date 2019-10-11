@@ -20,9 +20,13 @@ import (
 func main() {
 	var (
 		kubeconfig string
+        hostedName string
+        createReplicas bool
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
+    flag.StringVar(&hostedName, "hosted-namespace", "", "namespace of the hosted cluster (eg: 'hosted')")
+    flag.BoolVar(&createReplicas, "create-replicas", false, "Create replicas for the copy for any machineset having > 0 replicas (default: false)")
 	flag.Parse()
 	kconfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -74,32 +78,35 @@ func main() {
 	}
 	//fmt.Println("map: ", msMap)
 	for _, msName := range originalMachineSetNames {
-		if _, ok := msMap[msName+"-remote"]; ok {
+		if _, ok := msMap[msName+"-"+hostedName]; ok {
 			// already copied to remote.
 			continue
 		}
 		ms := *msMap[msName]
 		newMS := ms.DeepCopy()
 		replicasDesired := int32(0)
+        if createReplicas && *newMS.Spec.Replicas > int32(0) {
+            replicasDesired = int32(1)
+        }
 		newMS.Spec.Replicas = &replicasDesired
 		newObjectMeta := metav1.ObjectMeta{
 			Namespace: "openshift-machine-api",
-			Name:      msName + "-remote",
+			Name:      msName + "-"+hostedName,
 			Labels: map[string]string{
 				"remote": "remote",
 			},
 		}
 		newMS.ObjectMeta = newObjectMeta
 		newMS.Status = machineapi.MachineSetStatus{}
-		newMS.Spec.Template.ObjectMeta.Labels["machine.openshift.io/cluster-api-machineset"] = msName + "-remote"
-		newMS.Spec.Selector.MatchLabels["machine.openshift.io/cluster-api-machineset"] = msName + "-remote"
+		newMS.Spec.Template.ObjectMeta.Labels["machine.openshift.io/cluster-api-machineset"] = msName + "-"+hostedName
+		newMS.Spec.Selector.MatchLabels["machine.openshift.io/cluster-api-machineset"] = msName + "-"+hostedName
 
 		conf, err2 := providerConfigFromMachine(newMS.Spec.Template, codec)
 		if err2 != nil {
 			fmt.Println("failed to get provider spec: ", err2)
 			os.Exit(1)
 		}
-		conf.UserDataSecret = &corev1.LocalObjectReference{Name: conf.UserDataSecret.Name + "-remote"}
+		conf.UserDataSecret = &corev1.LocalObjectReference{Name: msName + "-worker-user-data"}
 		//fmt.Println("spec: %v", conf)
 		newMS.Spec.Template.Spec.ProviderSpec.Value = &runtime.RawExtension{Object: conf}
 		newMachineSets = append(newMachineSets, newMS)
